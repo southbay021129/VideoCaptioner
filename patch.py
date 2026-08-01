@@ -14,10 +14,9 @@ def patch_entities(root: Path) -> bool:
     f = root / "videocaptioner" / "core" / "entities.py"
     content = f.read_text(encoding="utf-8")
 
-    if "JSON" in content and "TXTP" in content and "TranscribeOutputFormatEnum" in content:
-        if 'JSON = "JSON"' in content and 'TXTP = "TXTP"' in content:
-            print(f"  [SKIP] {f.name} - already patched")
-            return False
+    if 'JSON = "JSON"' in content and 'TXTP = "TXTP"' in content:
+        print(f"  [SKIP] {f.name} - already patched")
+        return False
 
     content = content.replace(
         '    TXT = "TXT"\n    ALL = "All"',
@@ -84,33 +83,104 @@ def patch_task_factory(root: Path) -> bool:
     return True
 
 
+def patch_transcript_thread(root: Path) -> bool:
+    """TXTP 格式导出时使用 .txt 后缀（Windows 兼容）"""
+    f = root / "videocaptioner" / "ui" / "thread" / "transcript_thread.py"
+    content = f.read_text(encoding="utf-8")
+
+    if "FORMAT_EXT_MAP" in content:
+        print(f"  [SKIP] {f.name} - already patched")
+        return False
+
+    old_import = (
+        "from videocaptioner.core.entities import TranscribeOutputFormatEnum, TranscribeTask\n"
+    )
+    new_import = (
+        "from videocaptioner.core.entities import TranscribeOutputFormatEnum, TranscribeTask\n"
+        "\n"
+        "# GUI 显示名 vs 实际文件扩展名\n"
+        "# TXTP 在 GUI 中用于区分纯文本和带时间戳的 TXT，但导出时用 .txt 后缀\n"
+        "FORMAT_EXT_MAP = {\n"
+        '    "txtp": "txt",\n'
+        "}\n"
+    )
+    content = content.replace(old_import, new_import)
+
+    old_line = '                save_path = f"{base_path}.{fmt}"'
+    new_line = '                ext = FORMAT_EXT_MAP.get(fmt, fmt)\n                save_path = f"{base_path}.{ext}"'
+    content = content.replace(old_line, new_line)
+
+    old_save_call = "                asr_data.save(save_path)"
+    new_save_call = "                asr_data.save(save_path, output_format=output_format_enum)"
+    content = content.replace(old_save_call, new_save_call)
+
+    f.write_text(content, encoding="utf-8")
+    print(f"  [OK] {f.name} - TXTP exports as .txt, passes format to save()")
+    return True
+
+
 def patch_asr_data(root: Path) -> bool:
-    """添加 to_word_json()、to_plain_text()，更新 save()"""
+    """添加 to_word_json()、to_plain_text()，更新 save() 支持 format 参数"""
     f = root / "videocaptioner" / "core" / "asr" / "asr_data.py"
     content = f.read_text(encoding="utf-8")
 
     if "def to_word_json" in content:
-        print(f"  [SKIP] {f.name} - already patched")
+        print(f"  [SKIP] {f.name} - already patched (to_word_json exists)")
         return False
 
-    old_save = (
-        '        elif save_path.endswith(".json"):\n'
-        '            with open(save_path, "w", encoding="utf-8") as f:\n'
-        '                json.dump(self.to_json(), f, ensure_ascii=False, indent=2)\n'
-        '        elif save_path.endswith(".ass"):'
-    )
-    new_save = (
-        '        elif save_path.endswith(".json"):\n'
-        '            with open(save_path, "w", encoding="utf-8") as f:\n'
-        '                json.dump(self.to_word_json(), f, ensure_ascii=False, indent=2)\n'
-        '        elif save_path.endswith(".txtp"):\n'
-        '            with open(save_path, "w", encoding="utf-8") as f:\n'
-        '                f.write(self.to_plain_text())\n'
-        '        elif save_path.endswith(".ass"):'
-    )
-    content = content.replace(old_save, new_save)
+    # Step 1: 更新 save() 签名，添加 output_format 参数
+    if "output_format" not in content.split("def save(")[1].split("\n    def ")[0]:
+        old_sig = (
+            "    def save(\n"
+            "        self,\n"
+            "        save_path: str,\n"
+            "        ass_style: Optional[str] = None,\n"
+            "        layout: SubtitleLayoutEnum = SubtitleLayoutEnum.ORIGINAL_ON_TOP,\n"
+            "    ) -> None:"
+        )
+        new_sig = (
+            "    def save(\n"
+            "        self,\n"
+            "        save_path: str,\n"
+            "        ass_style: Optional[str] = None,\n"
+            "        layout: SubtitleLayoutEnum = SubtitleLayoutEnum.ORIGINAL_ON_TOP,\n"
+            '        output_format: Optional["TranscribeOutputFormatEnum"] = None,\n'
+            "    ) -> None:"
+        )
+        content = content.replace(old_sig, new_sig)
 
-    insert_after = (
+    # Step 2: 在 save() 方法体开头插入 output_format 优先判断
+    # 使用正则匹配 save() 方法中 handle_long_path 之前的区域
+    if "output_format == TranscribeOutputFormatEnum" not in content:
+        # 找到 save() 方法中的 "save_path = handle_long_path(save_path)" 这行
+        # 在它前面插入 format 判断逻辑
+        # 使用正则来确保精确匹配 save() 方法中的那行
+        pattern = r'(    def save\(.*?\) -> None:.*?)(        save_path = handle_long_path\(save_path\))'
+        replacement = (
+            r'\1'
+            "        # output_format 优先：TXTP -> 纯文本, JSON -> 词级JSON\n"
+            "        if output_format is not None:\n"
+            "            from videocaptioner.core.entities import TranscribeOutputFormatEnum\n"
+            "            Path(save_path).parent.mkdir(parents=True, exist_ok=True)\n"
+            "            save_path = handle_long_path(save_path)\n"
+            "            if output_format == TranscribeOutputFormatEnum.TXTP:\n"
+            '                with open(save_path, "w", encoding="utf-8") as f:\n'
+            "                    f.write(self.to_plain_text())\n"
+            "                return\n"
+            "            elif output_format == TranscribeOutputFormatEnum.JSON:\n"
+            '                with open(save_path, "w", encoding="utf-8") as f:\n'
+            "                    json.dump(self.to_word_json(), f, ensure_ascii=False, indent=2)\n"
+            "                return\n"
+            "\n"
+            r'\2'
+        )
+        content, n = re.subn(pattern, replacement, content, flags=re.DOTALL, count=1)
+        if n == 0:
+            print(f"  [WARN] {f.name} - could not find save() method body to patch")
+            return False
+
+    # Step 3: 添加 to_word_json() 和 to_plain_text() 方法
+    insert_marker = (
         "            }\n"
         "        return result_json\n"
         "\n"
@@ -193,10 +263,14 @@ def patch_asr_data(root: Path) -> bool:
         "    def to_ass("
     )
 
-    content = content.replace(insert_after, new_methods)
+    if insert_marker in content:
+        content = content.replace(insert_marker, new_methods)
+    else:
+        print(f"  [WARN] {f.name} - could not find insert point for to_word_json/to_plain_text")
+        return False
 
     f.write_text(content, encoding="utf-8")
-    print(f"  [OK] {f.name} - added to_word_json(), to_plain_text(), updated save()")
+    print(f"  [OK] {f.name} - added to_word_json(), to_plain_text(), updated save() with format param")
     return True
 
 
@@ -219,6 +293,7 @@ def main():
     changed = False
     changed |= patch_entities(root)
     changed |= patch_task_factory(root)
+    changed |= patch_transcript_thread(root)
     changed |= patch_asr_data(root)
 
     print()
